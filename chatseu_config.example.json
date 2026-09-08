@@ -1,0 +1,8 @@
+{
+  "jsessionid": "在此填入你的 JSESSIONID（或留空使用自动登录）",
+  "gateway_cookie": "",
+  "default_model": "qwen3.5-397b",
+  "username": "你的学号",
+  "password": "你的密码",
+  "fingerprint": ""
+}

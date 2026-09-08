@@ -1,0 +1,20 @@
+# 敏感信息: 账密、JSESSIONID、cookie 等, 绝不提交
+chatseu_config.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# IDE / 系统
+.DS_Store
+.idea/
+.vscode/
+
+# 工作区内部数据
+.workbuddy/
