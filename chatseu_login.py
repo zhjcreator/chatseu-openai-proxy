@@ -45,20 +45,25 @@ class TLSAdapter(HTTPAdapter):
 CHATSEU_SERVICE = "https://chatseu.seu.edu.cn/api/cas/call-back?url=L2NoYXQ*"
 
 
-def chatseu_login(username: str, password: str, fingerprint: str = None):
+def chatseu_login(username: str, password: str, fingerprint: str = None,
+                  proxy: str = None, atrust_session=None):
     """完整登录流程, 返回 (jsessionid, cookies_dict) 或 (None, None)。
 
     Args:
         username: 一卡通号
         password: 密码 (明文)
         fingerprint: 设备指纹 (可选, 用于免验证码)
+        proxy: HTTP/HTTPS 代理 URL (非校园网时用, 如 http://127.0.0.1:7890)
+        atrust_session: 已通过 aTrust 认证的 requests.Session (非校园网时传入,
+                        其网关 Cookie 会合并进 CAS 登录会话以放行)
 
     Returns:
         jsessionid: ChatSEU 域的 JSESSIONID
         cookies_dict: 完整 Cookie 字典 (含 JSESSIONID 和网关 cookie)
     """
     # 1. 向统一身份认证发起登录
-    session, redirect_url, error = seu_login(username, password, CHATSEU_SERVICE, fingerprint)
+    session, redirect_url, error = seu_login(
+        username, password, CHATSEU_SERVICE, fingerprint, proxy=proxy)
 
     if error == 'non_trusted_device':
         raise RuntimeError(
@@ -72,6 +77,13 @@ def chatseu_login(username: str, password: str, fingerprint: str = None):
     session.mount("https://", TLSAdapter())
     session.mount("http://", TLSAdapter())
     session.headers.pop("Content-Type", None)
+    if proxy:
+        session.proxies = {"http": proxy, "https": proxy}
+
+    # 2.5 非校园网: 合并 aTrust 会话 Cookie, 使网关放行
+    if atrust_session is not None:
+        for c in atrust_session.cookies:
+            session.cookies.set(c.name, c.value, domain=c.domain, path=c.path)
 
     try:
         resp = session.get(redirect_url, verify=False, allow_redirects=True, timeout=60)

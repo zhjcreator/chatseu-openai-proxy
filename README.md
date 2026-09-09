@@ -175,3 +175,63 @@ python3 chatseu_proxy.py --no-history
 2. **会话状态**:代理重启时会自动从网页拉取历史恢复;运行中新建的会话若未在网页侧同步,重启后可能丢失。
 3. **并发限制**:ThreadingHTTPServer 多线程处理,但上游对同一 JSESSIONID 的并发可能有排队。
 4. **仅限校内网络**:代理需运行在能访问 chatseu.seu.edu.cn 的网络环境(校园网或 VPN)。
+
+## 非校园网:aTrust 网关自动认证
+
+非校园网(公网出口)访问 `chatseu.seu.edu.cn` 时,会被东南大学的 **aTrust 网关**(深信服 Sangfor,`vpn.seu.edu.cn`)拦截,302 跳转到认证页。本代理支持**自动打通这条认证链路**。
+
+### 认证原理
+
+```
+chatseu.seu.edu.cn (公网出口)
+  └─ 302 → /controller/v1/public/verify?t=<JWT>          [网关拦截]
+  └─ 302 → /portal/shortcut.html?t=<JWT>                 [建立网关会话]
+  └─ GET /passport/v1/public/authConfig                  [拿认证配置]
+  └─ GET /passport/v1/public/casLogin?sfDomain=CAS-auth  [触发 CAS 跳转]
+  └─ 302 → auth.seu.edu.cn/dist/#/dist/main/login         [统一身份认证]
+  └─ CAS 登录(复用 seu_auth.py) → 带 ticket 回调
+  └─ GET /passport/v1/auth/cas?ticket=<CAS_TICKET>        [下发 sid/TGT 会话]
+  └─ POST /controller/v1/public/reportEnv                 [上报浏览器环境]
+  └─ GET /passport/v1/auth/authCheck                      [ACL 校验, 轮换 sidTicket]
+  └─ POST /passport/v1/public/sessionIdExchange           [兑换新会话]
+  └─ 携带 aTrust Cookie + JSESSIONID 访问上游 → 放行
+```
+
+核心机制:东南大学的 aTrust 配置了 **CAS 单点登录联动**——"校内人员"登录域(`auth/cas`)会把用户重定向到 `auth.seu.edu.cn` 做统一身份认证,认证成功后 aTrust 下发 `sidTicket` 会话放行。这与代理已有的 CAS 登录**同源**,复用 `seu_auth.py`。
+
+关键细节:
+- **authCheck 只需 `clientType=SDPBrowserClient` 一个参数**(多带 `platform`/`lang` 会触发 422)。
+- 网关对**每个 URL 路径**都做 verify,访问上游 API 时需**同时携带 aTrust Cookie + JSESSIONID**,并跟随 307→verify→回跳(附 `sdpAppCode`)的重定向链。
+
+### 使用方式
+
+1. 配置账密 + 公网出口代理:
+
+```json
+{
+  "username": "你的学号",
+  "password": "你的密码",
+  "proxy": "http://127.0.0.1:7890"
+}
+```
+
+2. 启动时加 `--proxy`(或直接读配置):
+
+```bash
+python3 chatseu_proxy.py --proxy http://127.0.0.1:7890
+```
+
+启动时会自动:走 aTrust 认证链路 → 打通非校园网访问 → 正常 CAS 登录拿 JSESSIONID。
+
+### 两种触发方式
+
+- **启动预认证**:配置了 `proxy` + 账密时,启动即完成 aTrust 认证。
+- **运行时自动触发**:上游请求遇 302 `vpn.seu.edu.cn` 拦截时,自动触发 `atrust_auth.py` 认证后重试。
+
+### 单独测试认证模块
+
+```bash
+python3 atrust_auth.py <一卡通号> <密码> http://127.0.0.1:7890
+```
+
+> 依赖 `requests` + `pycryptodome`(与自动登录一致)。若遇"非可信设备"需手机验证码,需在 `atrust_auth.py` 传入 `mobile_verify_code`。

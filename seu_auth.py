@@ -28,10 +28,16 @@ from Crypto.PublicKey import RSA
 from requests.adapters import HTTPAdapter
 
 
-def create_session():
-    """创建默认不继承系统代理环境变量的会话。"""
+def create_session(proxy=None):
+    """创建默认不继承系统代理环境变量的会话。
+
+    Args:
+        proxy: 可选, HTTP/HTTPS 代理 URL (非校园网时用于访问 auth.seu.edu.cn)。
+    """
     session = requests.Session()
     session.trust_env = False
+    if proxy:
+        session.proxies = {"http": proxy, "https": proxy}
     return session
 
 class TLSAdapter(HTTPAdapter):
@@ -53,16 +59,19 @@ class TLSAdapter(HTTPAdapter):
         return super().init_poolmanager(*args, **kwargs)
 
 
-def get_pub_key():
+def get_pub_key(proxy=None):
     """从服务器请求RSA公钥并保存cookie（使用session就不需要另外保存cookie）。
     RSA公钥是变化的，并且应该和cookie有关联，每次登录前需要重新获取。
+
+    Args:
+        proxy: 可选, HTTP/HTTPS 代理 URL。
 
     Returns:
         session: 包含了和公钥配对的cookie的session，用于后续发起登录请求
         pub_key: RSA公钥
     """
     try:
-        session = create_session()
+        session = create_session(proxy)
         session.mount("https://", TLSAdapter())
 
         # Headers中的Content-Type、UA必填；
@@ -126,13 +135,16 @@ def rsa_encrypt(message, pub_key):
         return None
 
 
-def seu_login(username, password, service_url='', fingerprint=None, mobile_verify_code=None):
+def seu_login(username, password, service_url='', fingerprint=None, mobile_verify_code=None, proxy=None):
     """向统一身份认证平台发起登录请求。
 
     Args:
         username: 一卡通号
         password: 用户密码（明文）
         service_url: 所要访问服务的url，如`http://ehall.seu.edu.cn`
+        fingerprint: 设备指纹（可选）
+        mobile_verify_code: 手机验证码（可选，非可信设备场景）
+        proxy: 可选, HTTP/HTTPS 代理 URL（非校园网时访问 auth.seu.edu.cn 用）
 
     Returns:
         session: 成功通过身份认证的session，用于后续访问其他服务
@@ -140,7 +152,7 @@ def seu_login(username, password, service_url='', fingerprint=None, mobile_verif
         error_info: 失败时返回错误信息字符串，成功时为 None
     """
     # 获取RSA公钥
-    session, pub_key = get_pub_key()
+    session, pub_key = get_pub_key(proxy)
     if not session:
         return None, None, "获取RSA公钥失败，请检查网络连接"
 

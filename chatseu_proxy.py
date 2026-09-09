@@ -30,6 +30,13 @@ from collections import OrderedDict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+# 可选: 非校园网 aTrust 认证 (需 requests + pycryptodome)
+try:
+    import atrust_auth
+    _HAS_ATRUST = True
+except Exception:
+    _HAS_ATRUST = False
+
 # ---------------------------------------------------------------- 配置
 
 CONFIG_PATH = Path(__file__).parent / "chatseu_config.json"
@@ -45,6 +52,10 @@ MODEL_CODE_TO_NAME = {v: k for k, v in MODEL_MAP.items()}
 
 UPSTREAM_BASE = "https://chatseu.seu.edu.cn"
 POST_PATH = "/api/chat/streamchat"
+
+# 非校园网 aTrust 网关认证状态 (进程级单例, 认证一次后复用会话 Cookie)
+ATRUST_SESSION = None  # requests.Session, 携带 aTrust 会话 Cookie
+ATRUST_PROXY = None    # 公网出口代理 URL
 
 DEFAULT_HEADERS = {
     "Content-Type": "application/json; charset=utf-8",
@@ -69,6 +80,7 @@ def load_config() -> dict:
     cfg["default_model"] = os.environ.get("CHATSEU_DEFAULT_MODEL", cfg.get("default_model", "qwen3.5-397b"))
     cfg["username"] = os.environ.get("CHATSEU_USERNAME", cfg.get("username", ""))
     cfg["password"] = os.environ.get("CHATSEU_PASSWORD", cfg.get("password", ""))
+    cfg["proxy"] = os.environ.get("CHATSEU_PROXY", cfg.get("proxy", ""))
     return cfg
 
 
@@ -85,6 +97,7 @@ def auto_login(cfg: dict):
     """用账密自动登录, 刷新 JSESSIONID 并回写配置。
 
     返回更新后的 cookie 字符串。
+    非校园网模式 (配置了 proxy 且有 atrust 会话) 会复用 aTrust 会话。
     """
     username = cfg.get("username")
     password = cfg.get("password")
@@ -93,7 +106,11 @@ def auto_login(cfg: dict):
 
     try:
         from chatseu_login import chatseu_login
-        jsid, cookies = chatseu_login(username, password, cfg.get("fingerprint"))
+        # 非校园网: 复用已建立的 aTrust 会话 (若有)
+        atrust_sess = ATRUST_SESSION if ATRUST_PROXY else None
+        jsid, cookies = chatseu_login(
+            username, password, cfg.get("fingerprint"),
+            proxy=ATRUST_PROXY, atrust_session=atrust_sess)
         cfg["jsessionid"] = jsid
         # 更新网关 cookie
         gw = next((v for k, v in cookies.items() if k != "JSESSIONID"), "")
@@ -117,7 +134,71 @@ class SessionExpiredError(RuntimeError):
     """上游会话 (JSESSIONID) 失效。"""
 
 
+class AtrustRedirectError(RuntimeError):
+    """非校园网下被 aTrust 网关拦截 (302 到 vpn.seu.edu.cn)。"""
+
+
 # ---------------------------------------------------------------- 上游调用
+
+# 全局上游代理 opener (支持公网出口)
+_UPSTREAM_OPENER = None
+
+
+def _build_upstream_opener():
+    """构造上游 urllib opener, 支持通过公网代理出口访问。"""
+    global _UPSTREAM_OPENER, ATRUST_PROXY
+    if _UPSTREAM_OPENER is not None:
+        return _UPSTREAM_OPENER
+    handlers = []
+    if ATRUST_PROXY:
+        handlers.append(urllib.request.ProxyHandler({
+            "http": ATRUST_PROXY, "https": ATRUST_PROXY,
+        }))
+    _UPSTREAM_OPENER = urllib.request.build_opener(*handlers)
+    return _UPSTREAM_OPENER
+
+
+def _set_upstream_proxy(proxy):
+    """设置上游公网出口代理并重建 opener。"""
+    global _UPSTREAM_OPENER, ATRUST_PROXY
+    ATRUST_PROXY = proxy
+    _UPSTREAM_OPENER = None
+    if proxy:
+        _build_upstream_opener()
+
+
+def ensure_atrust_session(cfg):
+    """确保非校园网 aTrust 会话已建立。
+
+    当上游直连遇到 vpn.seu.edu.cn 302 拦截时调用。返回 True 表示已认证。
+    """
+    global ATRUST_SESSION
+    if not _HAS_ATRUST:
+        print("[warn] 检测到 aTrust 网关拦截, 但未安装 atrust_auth 依赖 (requests/pycryptodome)")
+        return False
+    username = cfg.get("username")
+    password = cfg.get("password")
+    if not username or not password:
+        print("[warn] 检测到 aTrust 网关拦截, 但未配置账密, 无法自动认证")
+        return False
+    if ATRUST_SESSION is not None:
+        return True
+    print("[info] 检测到 aTrust 网关拦截, 开始非校园网自动认证...")
+    try:
+        sess, ticket, _ = atrust_auth.atrust_authenticate(
+            username, password, proxy=ATRUST_PROXY, fingerprint=cfg.get("fingerprint"))
+        ATRUST_SESSION = sess
+        print(f"[ok] aTrust 认证成功, CAS ticket={ticket[:12] if ticket else ''}...")
+        # aTrust 放行后, 紧接着用同一会话走 chatseu 登录拿 JSESSIONID
+        try:
+            auto_login(cfg)
+        except Exception as e2:
+            print(f"[warn] aTrust 后 chatseu 登录失败: {e2}")
+        return True
+    except Exception as e:
+        print(f"[error] aTrust 认证失败: {e}")
+        return False
+
 
 def post_message(cookie: str, conversation_id: str, model_code: int,
                  content: str, enable_search: bool = False,
@@ -131,15 +212,47 @@ def post_message(cookie: str, conversation_id: str, model_code: int,
         "fileIds": file_ids or [],
         "enableSearch": enable_search,
     }
+
+    # 非校园网: 用 aTrust requests 会话发请求 (自动跟随 307→verify→回跳重定向链)
+    if ATRUST_SESSION is not None:
+        _ensure_jsessionid_on_atrust(cookie)
+        try:
+            import requests as _req
+            r = ATRUST_SESSION.post(
+                UPSTREAM_BASE + POST_PATH, json=body,
+                headers={"Referer": DEFAULT_HEADERS["Referer"],
+                         "User-Agent": DEFAULT_HEADERS["User-Agent"]},
+                allow_redirects=True, timeout=60, verify=False)
+            if r.status_code != 200:
+                if "vpn.seu.edu.cn" in r.url:
+                    raise AtrustRedirectError(str(r.status_code))
+                raise RuntimeError(f"上游 HTTP {r.status_code}")
+            result = r.json()
+        except Exception as e:
+            if isinstance(e, (AtrustRedirectError, RuntimeError)):
+                raise
+            raise RuntimeError(f"上游错误: {e}")
+        # 返回体也可能包含"请重新登录"
+        if isinstance(result, dict) and "请重新登录" in str(result.get("message", "")):
+            raise SessionExpiredError(str(result))
+        if result.get("code") != 0:
+            raise RuntimeError(f"上游错误: {result}")
+        return result["response"]  # messageId
+
+    # 校园网: 原 urllib 直连路径
     data = json.dumps(body).encode("utf-8")
     headers = dict(DEFAULT_HEADERS)
     headers["Cookie"] = cookie
     req = urllib.request.Request(UPSTREAM_BASE + POST_PATH, data=data,
                                  headers=headers, method="POST")
+    opener = _build_upstream_opener()
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with opener.open(req, timeout=60) as resp:
             result = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
+        # aTrust 网关拦截 (302 到 vpn.seu.edu.cn)
+        if atrust_auth.detect_atrust_redirect(e) if _HAS_ATRUST else False:
+            raise AtrustRedirectError(str(e))
         # 302 / 401 等: 会话失效, 尝试自动重登
         if e.code in (302, 401, 403):
             raise SessionExpiredError(str(e))
@@ -152,9 +265,51 @@ def post_message(cookie: str, conversation_id: str, model_code: int,
     return result["response"]  # messageId
 
 
+def _ensure_jsessionid_on_atrust(cookie: str):
+    """把 JSESSIONID 注入 aTrust requests 会话 (chatseu 域)。
+
+    cookie 形如 "JSESSIONID=xxx; k=v"。
+    """
+    for part in cookie.split(";"):
+        part = part.strip()
+        if "=" in part:
+            k, _, v = part.partition("=")
+            if k.strip() == "JSESSIONID":
+                ATRUST_SESSION.cookies.set(
+                    "JSESSIONID", v.strip(), domain="chatseu.seu.edu.cn", path="/")
+                return
+
+
 def stream_events(cookie: str, message_id: str):
     """GET SSE 流式读取, 逐条 yield 正文文本片段 (过滤 metadata / 结束标记)。"""
     url = f"{UPSTREAM_BASE}{POST_PATH}?messageId={message_id}"
+
+    # 非校园网: 用 aTrust requests 会话流式读取 (自动跟随重定向)
+    if ATRUST_SESSION is not None:
+        _ensure_jsessionid_on_atrust(cookie)
+        import requests as _req
+        r = ATRUST_SESSION.get(
+            url, headers={"Accept": "text/event-stream",
+                          "Referer": DEFAULT_HEADERS["Referer"],
+                          "User-Agent": DEFAULT_HEADERS["User-Agent"]},
+            stream=True, allow_redirects=True, timeout=300, verify=False)
+        if r.status_code != 200:
+            raise RuntimeError(f"上游 SSE 错误: HTTP {r.status_code}")
+        # 注意: Content-Type 无 charset, requests 会误判为 ISO-8859-1,
+        # 需用原始 bytes 手动按 UTF-8 解码。
+        for raw in r.iter_lines(decode_unicode=False):
+            line = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if not payload or payload == "[DONE]":
+                continue
+            if payload.startswith("{") and '"now"' in payload:
+                continue
+            yield payload
+        return
+
+    # 校园网: 原 urllib 流式路径
     headers = {
         "Accept": "text/event-stream",
         "Referer": DEFAULT_HEADERS["Referer"],
@@ -162,7 +317,8 @@ def stream_events(cookie: str, message_id: str):
         "Cookie": cookie,
     }
     req = urllib.request.Request(url, headers=headers, method="GET")
-    with urllib.request.urlopen(req, timeout=300) as resp:
+    opener = _build_upstream_opener()
+    with opener.open(req, timeout=300) as resp:
         for raw in resp:
             line = raw.decode("utf-8", errors="replace").rstrip("\n")
             if not line.startswith("data:"):
@@ -449,6 +605,18 @@ class ChatSEUProxy(BaseHTTPRequestHandler):
         try:
             mid = post_message(ChatSEUProxy.cookie, cid,
                                model_code, content, enable_search)
+        except AtrustRedirectError:
+            # 非校园网 aTrust 拦截: 自动认证后重试一次
+            print("[warn] 上游被 aTrust 网关拦截, 尝试非校园网自动认证...")
+            if ensure_atrust_session(ChatSEUProxy.cfg):
+                try:
+                    mid = post_message(ChatSEUProxy.cookie, cid,
+                                       model_code, content, enable_search)
+                except Exception as e2:
+                    return self._json({"error": {"message": f"atrust retry failed: {e2}"}}, 502)
+            else:
+                return self._json(
+                    {"error": {"message": "aTrust 认证失败: 请配置 username/password 并安装 requests/pycryptodome"}}, 502)
         except SessionExpiredError:
             # 会话失效, 自动重登后重试一次
             print("[warn] JSESSIONID 失效, 尝试自动重登...")
@@ -541,11 +709,23 @@ def main():
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--no-history", action="store_true",
                     help="启动时不拉取网页已有历史会话")
+    ap.add_argument("--proxy", default="",
+                    help="公网出口代理 (非校园网时用, 如 http://127.0.0.1:7890)")
     args = ap.parse_args()
 
     cfg = load_config()
     ChatSEUProxy.cfg = cfg
     ChatSEUProxy.cookie = build_cookie(cfg)
+
+    # 非校园网: 设置上游公网出口代理
+    if args.proxy or cfg.get("proxy"):
+        proxy = args.proxy or cfg.get("proxy")
+        _set_upstream_proxy(proxy)
+        print(f"[info] 上游出口代理已启用: {proxy} (非校园网模式)")
+        # 若配置了账密, 启动时即完成 aTrust 认证
+        if cfg.get("username") and cfg.get("password") and _HAS_ATRUST:
+            print("[info] 非校园网模式, 启动时预认证 aTrust...")
+            ensure_atrust_session(cfg)
 
     # 若配置了账密, 启动时自动登录刷新 JSESSIONID
     if cfg.get("username") and cfg.get("password"):
